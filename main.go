@@ -17,7 +17,7 @@ import (
 // โครงสร้างข้อมูล Product
 type Product struct {
 	ID    string  `json:"id"`
-	Name  string  `json:"name"` // เติม string ตรงนี้ครับ
+	Name  string  `json:"name"`
 	Price float64 `json:"price"`
 }
 
@@ -30,7 +30,7 @@ var (
 func main() {
 	r := gin.Default()
 
-	// 🔓 วางโค้ดบล็อกนี้เพื่อปลดล็อก CORS ให้หน้าบ้านในเครื่องดึงข้อมูลได้
+	// 🔓 ปลดล็อก CORS ให้หน้าบ้านเข้าถึง API ได้จากทุกที่
 	r.Use(func(c *gin.Context) {
 		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
 		c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
@@ -43,6 +43,10 @@ func main() {
 		}
 		c.Next()
 	})
+
+	// 🌐 Serving Static Files (เปิดให้ดึงหน้าเว็บ index.html จากเซิร์ฟเวอร์โดยตรง)
+	r.StaticFile("/", "./index.html")
+	r.StaticFile("/index.html", "./index.html")
 
 	// 1. เชื่อมต่อ PostgreSQL
 	var err error
@@ -77,16 +81,17 @@ func main() {
 
 	// --- ROUTES ZONE ---
 
-	// Test Routeเดิม
+	// Test Route เดิม
 	r.GET("/ping", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"db_status": true, "message": "pong"})
 	})
 
 	// CRUD Routes
-	r.POST("/products", createProduct)          // Create
-	r.GET("/products/:id", getProductWithCache) // Read (มีระบบ Redis Cache)
-	r.PUT("/products/:id", updateProduct)       // Update
-	r.DELETE("/products/:id", deleteProduct)    // Delete
+	r.POST("/products", createProduct)           // Create
+	r.GET("/products", getAllProductsWithCache)   // Read All (มี Redis Cache)
+	r.GET("/products/:id", getProductWithCache)  // Read One (มี Redis Cache)
+	r.PUT("/products/:id", updateProduct)        // Update
+	r.DELETE("/products/:id", deleteProduct)     // Delete
 
 	// เริ่มรัน server บนพอร์ตที่ Render กำหนด
 	port := os.Getenv("PORT")
@@ -114,10 +119,13 @@ func createProduct(c *gin.Context) {
 		return
 	}
 
+	// 🧹 เคลียร์แคชรายการทั้งหมดทิ้ง เพราะมีของใหม่เพิ่มเข้ามาแล้ว
+	_ = rdbClient.Del(ctx, "products:all")
+
 	c.JSON(http.StatusCreated, gin.H{"message": "Product created successfully", "data": p})
 }
 
-// 2. READ: ดึงข้อมูลสินค้า (มีระบบตรวจและเซ็ต Redis Cache ในตัว)
+// 2. READ ONE: ดึงข้อมูลสินค้าชิ้นเดียว (มีระบบ Redis Cache)
 func getProductWithCache(c *gin.Context) {
 	id := c.Param("id")
 	redisKey := "product:" + id
@@ -125,7 +133,6 @@ func getProductWithCache(c *gin.Context) {
 	// [STEP A] ตรวจสอบว่ามีข้อมูลใน Redis Cache ไหม
 	cachedData, err := rdbClient.Get(ctx, redisKey).Result()
 	if err == nil {
-		// เจอในแคช (Cache Hit!) -> แปลงข้อความกลับเป็น JSON แล้วส่งได้ทันทีแบบติดสปีด
 		var p Product
 		_ = json.Unmarshal([]byte(cachedData), &p)
 		c.JSON(http.StatusOK, gin.H{"source": "redis_cache", "data": p})
@@ -144,51 +151,14 @@ func getProductWithCache(c *gin.Context) {
 		return
 	}
 
-	// [STEP C] เจอข้อมูลใน DB -> เซ็ตลง Redis Cache เก็บไว้ใช้งานใน 60 วินาทีถัดไปก่อนส่งกลับ
+	// [STEP C] เจอข้อมูลใน DB -> เซ็ตลง Redis Cache เก็บไว้ใช้งานใน 60 วินาที
 	pBytes, _ := json.Marshal(p)
 	_ = rdbClient.Set(ctx, redisKey, pBytes, 60*time.Second).Err()
 
 	c.JSON(http.StatusOK, gin.H{"source": "postgresql_db", "data": p})
 }
 
-// 3. UPDATE: แก้ไขข้อมูลสินค้า
-func updateProduct(c *gin.Context) {
-	id := c.Param("id")
-	var p Product
-	if err := c.ShouldBindJSON(&p); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	_, err := dbConn.Exec(ctx, "UPDATE products SET name=$1, price=$2 WHERE id=$3", p.Name, p.Price, id)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update product"})
-		return
-	}
-
-	// เคลียร์แคชทิ้งทันทีเมื่อข้อมูลอัปเดต เพื่อป้องกันข้อมูลขัดแย้ง
-	_ = rdbClient.Del(ctx, "product:"+id)
-
-	c.JSON(http.StatusOK, gin.H{"message": "Product updated successfully"})
-}
-
-// 4. DELETE: ลบสินค้า
-func deleteProduct(c *gin.Context) {
-	id := c.Param("id")
-
-	_, err := dbConn.Exec(ctx, "DELETE FROM products WHERE id=$1", id)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete product"})
-		return
-	}
-
-	// เคลียร์แคชทิ้งทันทีเมื่อข้อมูลโดนลบ
-	_ = rdbClient.Del(ctx, "product:"+id)
-
-	c.JSON(http.StatusOK, gin.H{"message": "Product deleted successfully"})
-}
-
-// 5. READ ALL: ดึงข้อมูลสินค้าทั้งหมด (มีระบบตรวจและเซ็ต Redis Cache สำหรับ List)
+// 3. READ ALL: ดึงข้อมูลสินค้าทั้งหมด (มีระบบ Redis Cache สำหรับ List)
 func getAllProductsWithCache(c *gin.Context) {
 	redisKey := "products:all"
 
@@ -222,4 +192,43 @@ func getAllProductsWithCache(c *gin.Context) {
 	_ = rdbClient.Set(ctx, redisKey, pBytes, 60*time.Second).Err()
 
 	c.JSON(http.StatusOK, gin.H{"source": "postgresql_db", "data": products})
+}
+
+// 4. UPDATE: แก้ไขข้อมูลสินค้า
+func updateProduct(c *gin.Context) {
+	id := c.Param("id")
+	var p Product
+	if err := c.ShouldBindJSON(&p); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	_, err := dbConn.Exec(ctx, "UPDATE products SET name=$1, price=$2 WHERE id=$3", p.Name, p.Price, id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update product"})
+		return
+	}
+
+	// 🧹 ลบแคชเก่าของสินค้าชิ้นนี้ และแคชของรายการทั้งหมด เพื่อให้ข้อมูลอัปเดตตรงกัน
+	_ = rdbClient.Del(ctx, "product:"+id)
+	_ = rdbClient.Del(ctx, "products:all")
+
+	c.JSON(http.StatusOK, gin.H{"message": "Product updated successfully"})
+}
+
+// 5. DELETE: ลบสินค้า
+func deleteProduct(c *gin.Context) {
+	id := c.Param("id")
+
+	_, err := dbConn.Exec(ctx, "DELETE FROM products WHERE id=$1", id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete product"})
+		return
+	}
+
+	// 🧹 ลบแคชสินค้าชิ้นนี้ และแคชของรายการทั้งหมดออกทันที
+	_ = rdbClient.Del(ctx, "product:"+id)
+	_ = rdbClient.Del(ctx, "products:all")
+
+	c.JSON(http.StatusOK, gin.H{"message": "Product deleted successfully"})
 }
