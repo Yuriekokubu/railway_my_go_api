@@ -173,3 +173,39 @@ func deleteProduct(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{"message": "Product deleted successfully"})
 }
+
+// 5. READ ALL: ดึงข้อมูลสินค้าทั้งหมด (มีระบบตรวจและเซ็ต Redis Cache สำหรับ List)
+func getAllProductsWithCache(c *gin.Context) {
+	redisKey := "products:all"
+
+	// [STEP A] ตรวจสอบแคชใน Redis
+	cachedData, err := rdbClient.Get(ctx, redisKey).Result()
+	if err == nil {
+		var products []Product
+		_ = json.Unmarshal([]byte(cachedData), &products)
+		c.JSON(http.StatusOK, gin.H{"source": "redis_cache", "data": products})
+		return
+	}
+
+	// [STEP B] ถ้าไม่มีแคช -> ไปดึงจาก PostgreSQL
+	rows, err := dbConn.Query(ctx, "SELECT id, name, price FROM products")
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
+		return
+	}
+	defer rows.Close()
+
+	products := []Product{}
+	for rows.Next() {
+		var p Product
+		if err := rows.Scan(&p.ID, &p.Name, &p.Price); err == nil {
+			products = append(products, p)
+		}
+	}
+
+	// [STEP C] เซ็ตลง Redis Cache เก็บไว้ 60 วินาที
+	pBytes, _ := json.Marshal(products)
+	_ = rdbClient.Set(ctx, redisKey, pBytes, 60*time.Second).Err()
+
+	c.JSON(http.StatusOK, gin.H{"source": "postgresql_db", "data": products})
+}
