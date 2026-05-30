@@ -17,7 +17,7 @@ import (
 // โครงสร้างข้อมูล Product
 type Product struct {
 	ID    string  `json:"id"`
-	Name  string  `json:"name"`  // เติม string ตรงนี้ครับ
+	Name  string  `json:"name"` // เติม string ตรงนี้ครับ
 	Price float64 `json:"price"`
 }
 
@@ -29,6 +29,20 @@ var (
 
 func main() {
 	r := gin.Default()
+
+	// 🔓 วางโค้ดบล็อกนี้เพื่อปลดล็อก CORS ให้หน้าบ้านในเครื่องดึงข้อมูลได้
+	r.Use(func(c *gin.Context) {
+		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
+		c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
+		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, accept, origin, Cache-Control, X-Requested-With")
+		c.Writer.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS, GET, PUT, DELETE")
+
+		if c.Request.Method == "OPTIONS" {
+			c.AbortWithStatus(204)
+			return
+		}
+		c.Next()
+	})
 
 	// 1. เชื่อมต่อ PostgreSQL
 	var err error
