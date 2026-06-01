@@ -1,18 +1,25 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/go-redis/redis/v8"
 	"github.com/jackc/pgx/v4"
 )
+
+//go:embed index.html
+var indexHTML []byte
 
 // โครงสร้างข้อมูล Product
 type Product struct {
@@ -25,9 +32,16 @@ var (
 	ctx       = context.Background()
 	dbConn    *pgx.Conn
 	rdbClient *redis.Client
+	appEnv    = "production"
 )
 
 func main() {
+	loadConfig()
+
+	if appEnv == "production" {
+		gin.SetMode(gin.ReleaseMode)
+	}
+
 	r := gin.Default()
 
 	// 🔓 ปลดล็อก CORS ให้หน้าบ้านเข้าถึง API ได้จากทุกที่
@@ -45,15 +59,14 @@ func main() {
 	})
 
 	// 🌐 Serving Static Files (เปิดให้ดึงหน้าเว็บ index.html จากเซิร์ฟเวอร์โดยตรง)
-	r.StaticFile("/", "./index.html")
-	r.StaticFile("/index.html", "./index.html")
+	r.GET("/", serveIndex)
+	r.GET("/index.html", serveIndex)
 
 	// 1. เชื่อมต่อ PostgreSQL
 	var err error
 	dbConn, err = pgx.Connect(ctx, os.Getenv("DATABASE_URL"))
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Unable to connect to database: %v\n", err)
-		os.Exit(1)
+		exitWithError("Unable to connect to database: %v", err)
 	}
 	defer dbConn.Close(ctx)
 	fmt.Println("Connected to PostgreSQL successfully!")
@@ -69,13 +82,11 @@ func main() {
 	// 2. เชื่อมต่อ Redis
 	opt, err := redis.ParseURL(os.Getenv("REDIS_URL"))
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Unable to parse Redis URL: %v\n", err)
-		os.Exit(1)
+		exitWithError("Unable to parse Redis URL: %v", err)
 	}
 	rdbClient = redis.NewClient(opt)
 	if err := rdbClient.Ping(ctx).Err(); err != nil {
-		fmt.Fprintf(os.Stderr, "Unable to connect to Redis: %v\n", err)
-		os.Exit(1)
+		exitWithError("Unable to connect to Redis: %v", err)
 	}
 	fmt.Println("Connected to Redis successfully!")
 
@@ -87,18 +98,119 @@ func main() {
 	})
 
 	// CRUD Routes
-	r.POST("/products", createProduct)           // Create
-	r.GET("/products", getAllProductsWithCache)   // Read All (มี Redis Cache)
-	r.GET("/products/:id", getProductWithCache)  // Read One (มี Redis Cache)
-	r.PUT("/products/:id", updateProduct)        // Update
-	r.DELETE("/products/:id", deleteProduct)     // Delete
+	r.POST("/products", createProduct)          // Create
+	r.GET("/products", getAllProductsWithCache) // Read All (มี Redis Cache)
+	r.GET("/products/:id", getProductWithCache) // Read One (มี Redis Cache)
+	r.PUT("/products/:id", updateProduct)       // Update
+	r.DELETE("/products/:id", deleteProduct)    // Delete
 
 	// เริ่มรัน server บนพอร์ตที่ Render กำหนด
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "10000"
 	}
-	r.Run(":" + port)
+	fmt.Printf("Starting %s server on port %s\n", appEnv, port)
+	if err := r.Run(":" + port); err != nil {
+		exitWithError("Unable to start server on port %s: %v", port, err)
+	}
+}
+
+func serveIndex(c *gin.Context) {
+	c.Data(http.StatusOK, "text/html; charset=utf-8", indexHTML)
+}
+
+func loadConfig() {
+	if env := strings.TrimSpace(os.Getenv("APP_ENV")); env != "" {
+		appEnv = env
+	}
+
+	for _, path := range envFilesFor(appEnv) {
+		if err := loadEnvFile(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			exitWithError("Unable to load %s: %v", path, err)
+		}
+	}
+
+	if os.Getenv("DATABASE_URL") == "" {
+		exitWithError("DATABASE_URL is empty. Please create .env.dev or .env.production and set DATABASE_URL.")
+	}
+	if os.Getenv("REDIS_URL") == "" {
+		exitWithError("REDIS_URL is empty. Please create .env.dev or .env.production and set REDIS_URL.")
+	}
+}
+
+func envFilesFor(env string) []string {
+	roots := envSearchRoots()
+	names := []string{}
+
+	switch strings.ToLower(env) {
+	case "dev", "development":
+		appEnv = "development"
+		names = []string{".env.dev", ".env.development", ".env"}
+	case "prod", "production":
+		appEnv = "production"
+		names = []string{".env.production", ".env.prod", ".env"}
+	default:
+		names = []string{".env." + env, ".env"}
+	}
+
+	files := make([]string, 0, len(roots)*len(names))
+	for _, root := range roots {
+		for _, name := range names {
+			files = append(files, filepath.Join(root, name))
+		}
+	}
+	return files
+}
+
+func envSearchRoots() []string {
+	roots := []string{"."}
+
+	exePath, err := os.Executable()
+	if err != nil {
+		return roots
+	}
+
+	exeDir := filepath.Dir(exePath)
+	parentDir := filepath.Dir(exeDir)
+
+	return append(roots, exeDir, parentDir)
+}
+
+func loadEnvFile(path string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+
+		key = strings.TrimSpace(key)
+		value = strings.Trim(strings.TrimSpace(value), `"'`)
+		if key != "" && os.Getenv(key) == "" {
+			_ = os.Setenv(key, value)
+		}
+	}
+
+	return scanner.Err()
+}
+
+func exitWithError(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, format+"\n", args...)
+	fmt.Fprintln(os.Stderr)
+	fmt.Fprintln(os.Stderr, "Press Enter to exit...")
+	_, _ = fmt.Scanln()
+	os.Exit(1)
 }
 
 // ==========================================

@@ -68,8 +68,7 @@
     </div>
 
     <script>
-        // ⚠️ เปลี่ยนเป็น URL บน Render ของคุณ
-        const API_BASE_URL = 'https://railway-my-go-api.onrender.com';
+        const API_BASE_URL = window.location.origin;
 
         const form = document.getElementById('product-form');
         const prodIdInput = document.getElementById('prod-id');
